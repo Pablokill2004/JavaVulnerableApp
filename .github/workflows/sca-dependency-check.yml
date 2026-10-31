@@ -1,0 +1,117 @@
+# ===========================================================================
+# Pipeline SCA: OWASP Dependency-Check (Parte E) + SBOM CycloneDX (extra)
+# Analiza las dependencias del proyecto en cada push/PR a main y publica
+# los resultados en GitHub (Code scanning + artefactos descargables).
+# La clave del NVD se guarda como secreto NVD_API_KEY y nunca aparece aquí.
+# ===========================================================================
+name: SCA - OWASP Dependency-Check # Nombre del workflow visible en la pestaña Actions
+
+on: # Define los eventos que disparan el pipeline (requisito 1)
+  push: # Ejecuta el análisis cuando se hace push...
+    branches: [ main ] # ...a la rama main
+  pull_request: # También ejecuta el análisis en los pull requests...
+    branches: [ main ] # ...dirigidos a main (bloqueo preventivo antes de mergear)
+  workflow_dispatch: # Permite lanzar el workflow manualmente desde la UI de Actions
+
+permissions: # Permisos mínimos del token GITHUB_TOKEN (requisito 2)
+  contents: read # Solo lectura del código del repositorio para el checkout
+  security-events: write # Escritura necesaria para publicar alertas SARIF en Code scanning
+
+concurrency: # Evita ejecuciones simultáneas del mismo workflow en la misma rama
+  group: sca-dependency-check-${{ github.ref }} # Un grupo por ref (rama/PR)
+  cancel-in-progress: true # Cancela la ejecución anterior si llega un commit nuevo
+
+jobs: # Definición de los trabajos del pipeline
+  dependency-check: # Job principal: OWASP Dependency-Check (requisitos 3-9)
+    name: Dependency-Check # Nombre legible del job en la UI de Actions
+    runs-on: ubuntu-latest # Máquina virtual limpia de Ubuntu para ejecutar los pasos
+
+    steps: # Secuencia de pasos del job
+      - name: Checkout del código # Descarga el código del repositorio en la VM
+        uses: actions/checkout@v4 # Acción oficial de GitHub para obtener los fuentes
+
+      - name: Preparar Java 17 # Cumple el requisito 3: JDK 17 en la VM
+        uses: actions/setup-java@v4 # Acción oficial para instalar y configurar Java
+        with: # Parámetros de la acción setup-java
+          distribution: temurin # Distribución Eclipse Temurin (OpenJDK estándar)
+          java-version: '17' # Versión de Java que pide Maven y Dependency-Check
+
+      - name: Cachear la base de datos del NVD # Cumple el requisito 5: reutilizar la BD del NVD
+        uses: actions/cache@v4 # Acción oficial de caché entre ejecuciones
+        with: # Parámetros de la acción cache
+          path: ~/.m2/repository/org/owasp # Ruta donde el plugin de Maven guarda los datos del NVD descargados
+          key: dependency-check-nvd-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }} # Clave única por ejecución para guardar la caché fresca
+          restore-keys: | # Si la clave exacta no existe, restaura la caché más reciente con este prefijo
+            dependency-check-nvd-${{ runner.os }}-
+
+      - name: Ejecutar OWASP Dependency-Check # Cumple el requisito 6: analizar dependencias (HTML, XML y SARIF)
+        env: # Variables de entorno del paso (requisito 4)
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }} # Lee la clave del NVD desde los secretos del repo; nunca se hardcodea
+        run: | # Comando Maven que invoca el goal check del plugin de Dependency-Check
+          mvn -B org.owasp:dependency-check-maven:13.0.0:check \
+            "-Dformat=ALL" \
+            "-DnvdApiKey=$NVD_API_KEY" \
+            "-DossindexAnalyzerEnabled=false" \
+            "-DfailBuildOnCVSS=7"
+        # Línea 1: -B pone Maven en modo batch (salida limpia, sin progreso interactivo)
+        # Goal check: descarga el NVD y busca CVEs en todas las dependencias del pom.xml
+        # -Dformat=ALL: genera HTML, XML, JSON y SARIF en target/
+        # -DnvdApiKey: usa la clave del secreto para descargar el NVD más rápido y sin bloqueos
+        # -DossindexAnalyzerEnabled=false: desactiva el analizador OSS Index (lento e inestable en CI)
+        # -DfailBuildOnCVSS=7: el build falla si aparece alguna vulnerabilidad con CVSS >= 7 (High/Critical)
+        # Nota: el paso puede fallar a propósito por Log4Shell; los siguientes pasos usan if: always()
+
+      - name: Subir SARIF a Code scanning # Cumple el requisito 7: publicar alertas en Security
+        if: always() # Sube los resultados aunque el paso anterior haya fallado por severidad
+        uses: github/codeql-action/upload-sarif@v3 # Acción que carga cualquier archivo SARIF en GitHub
+        with: # Parámetros de la acción upload-sarif
+          sarif_file: target/dependency-check-report.sarif # Ruta del reporte SARIF generado por Dependency-Check
+          category: dependency-check # Categoría que agrupa las alertas en Security > Code scanning
+
+      - name: Subir reportes HTML y XML como artefactos # Cumple el requisito 8: evidencia descargable
+        if: always() # Conserva los reportes incluso cuando el pipeline falla a propósito
+        uses: actions/upload-artifact@v4 # Acción oficial para guardar archivos de la VM
+        with: # Parámetros de la acción upload-artifact
+          name: dependency-check-reports # Nombre de la carpeta de artefactos descargable desde Actions
+          # Se suben 3 reportes generados por Dependency-Check en target/:
+          #   .html -> reporte HTML con el detalle de CVEs por dependencia (para el navegador)
+          #   .xml  -> reporte XML (el formato que importa DefectDojo en la Parte D)
+          #   .json -> reporte JSON como respaldo legible por máquinas
+          path: | # Lista de archivos que se incluyen en el artefacto
+            target/dependency-check-report.html
+            target/dependency-check-report.xml
+            target/dependency-check-report.json
+
+  generate-sbom: # Job extra (+5 pts): genera el SBOM CycloneDX del proyecto
+    name: SBOM CycloneDX # Nombre legible del job en la UI de Actions
+    runs-on: ubuntu-latest # Máquina virtual de Ubuntu para ejecutar la generación
+    # No necesita la clave del NVD: solo lista las dependencias del pom.xml
+
+    steps: # Secuencia de pasos del job de SBOM
+      - name: Checkout del código # Descarga el código del repositorio en la VM
+        uses: actions/checkout@v4 # Acción oficial de GitHub para obtener los fuentes
+
+      - name: Preparar Java 17 # Maven necesita un JDK para ejecutar el plugin de CycloneDX
+        uses: actions/setup-java@v4 # Acción oficial para instalar y configurar Java
+        with: # Parámetros de la acción setup-java
+          distribution: temurin # Distribución Eclipse Temurin (OpenJDK estándar)
+          java-version: '17' # Versión de Java compatible con el plugin de CycloneDX
+
+      - name: Cachear dependencias de Maven # Acelera el job reutilizando ~/.m2 entre ejecuciones
+        uses: actions/cache@v4 # Acción oficial de caché
+        with: # Parámetros de la acción cache
+          path: ~/.m2/repository # Repositorio local de Maven (descarga de plugins y dependencias)
+          key: maven-repo-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-${{ github.run_id }} # Clave única por ejecución
+          restore-keys: | # Prefijo para restaurar la caché previa cuando cambie el pom.xml
+            maven-repo-${{ runner.os }}-
+
+      - name: Generar SBOM CycloneDX # Ejecuta el plugin de CycloneDX sobre el proyecto
+        run: mvn -B org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom # Crea el agregado del SBOM del proyecto
+        # goal makeAggregateBom: resuelve el grafo completo de dependencias (directas y transitivas)
+        # y escribe el SBOM en target/bom.json (formato CycloneDX JSON)
+
+      - name: Subir SBOM como artefacto # Guarda el bom.json descargable desde la ejecución
+        uses: actions/upload-artifact@v4 # Acción oficial para publicar archivos de la VM
+        with: # Parámetros de la acción upload-artifact
+          name: cyclonedx-sbom # Nombre del artefacto que se ve en la sección Artifacts
+          path: target/bom.json # Ruta del SBOM CycloneDX generado por el paso anterior
